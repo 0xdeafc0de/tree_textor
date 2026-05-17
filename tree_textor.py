@@ -42,6 +42,19 @@ DEFAULT_BINARY_SUFFIX_EXCLUDES = {
     ".pyo",
 }
 
+K_V = "v"
+K_T = "t"
+K_R = "r"
+K_N = "n"
+K_F = "f"
+K_P = "p"
+K_Z = "z"
+K_H = "h"
+K_E = "e"
+K_C = "c"
+OBF_ASCII_SHIFT = 1
+OBF_INT_SHIFT = 7
+
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
@@ -49,6 +62,36 @@ def sha256_bytes(data: bytes) -> str:
 
 def chunk_text(text: str, width: int = 88) -> list[str]:
     return [text[i : i + width] for i in range(0, len(text), width)] or [""]
+
+
+def obf_str(value: str) -> str:
+    out = []
+    for ch in value:
+        code = ord(ch)
+        if 32 <= code <= 126:
+            out.append(chr(32 + ((code - 32 + OBF_ASCII_SHIFT) % 95)))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def deobf_str(value: str) -> str:
+    out = []
+    for ch in value:
+        code = ord(ch)
+        if 32 <= code <= 126:
+            out.append(chr(32 + ((code - 32 - OBF_ASCII_SHIFT) % 95)))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def obf_int(value: int) -> int:
+    return value + OBF_INT_SHIFT
+
+
+def deobf_int(value: int) -> int:
+    return value - OBF_INT_SHIFT
 
 
 def should_skip_file(path: Path, rel_parts: tuple[str, ...]) -> bool:
@@ -93,20 +136,20 @@ def pack(repo: Path, out_file: Path) -> None:
 
         files.append(
             {
-                "path": rel_path,
-                "size": len(raw),
-                "sha256": sha256_bytes(raw),
-                "encoding": PAYLOAD_ENCODING,
-                "chunks": chunk_text(b64, width=88),
+                K_P: obf_str(rel_path),
+                K_Z: obf_int(len(raw)),
+                K_H: obf_str(sha256_bytes(raw)),
+                K_E: obf_str(PAYLOAD_ENCODING),
+                K_C: chunk_text(b64, width=88),
             }
         )
 
     manifest = {
-        "tree_textor_version": FORMAT_VERSION,
-        "created_at_utc": datetime.now(timezone.utc).isoformat(),
-        "source_root_name": repo.name,
-        "file_count": len(files),
-        "files": files,
+        K_V: obf_str(FORMAT_VERSION),
+        K_T: obf_str(datetime.now(timezone.utc).isoformat()),
+        K_R: obf_str(repo.name),
+        K_N: obf_int(len(files)),
+        K_F: files,
     }
 
     out_file.parent.mkdir(parents=True, exist_ok=True)
@@ -125,27 +168,42 @@ def unpack(in_file: Path, out_repo: Path) -> None:
     with in_file.open("r", encoding="utf-8") as f:
         manifest = json.load(f)
 
-    version = str(manifest.get("tree_textor_version", ""))
+    version_raw = manifest.get(K_V, "")
+    if not isinstance(version_raw, str):
+        raise ValueError("Invalid manifest: version missing/invalid")
+    version = deobf_str(version_raw)
     if version != FORMAT_VERSION:
         raise ValueError(
             f"Unsupported format version: {version!r} (expected {FORMAT_VERSION!r})"
         )
 
-    files = manifest.get("files")
+    files = manifest.get(K_F)
     if not isinstance(files, list):
-        raise ValueError("Invalid manifest: 'files' must be a list")
+        raise ValueError("Invalid manifest: file list missing/invalid")
 
     out_repo.mkdir(parents=True, exist_ok=True)
 
     for entry in files:
-        rel_path = entry.get("path")
-        size = entry.get("size")
-        expected_hash = entry.get("sha256")
-        encoding = entry.get("encoding")
-        chunks = entry.get("chunks")
+        rel_path_raw = entry.get(K_P)
+        size_raw = entry.get(K_Z)
+        expected_hash_raw = entry.get(K_H)
+        encoding_raw = entry.get(K_E)
+        chunks = entry.get(K_C)
 
-        if not isinstance(rel_path, str) or not rel_path:
+        if not isinstance(rel_path_raw, str) or not rel_path_raw:
             raise ValueError("Invalid entry: missing/invalid path")
+        if not isinstance(size_raw, int):
+            raise ValueError("Invalid entry: missing/invalid size")
+        if not isinstance(expected_hash_raw, str) or not expected_hash_raw:
+            raise ValueError("Invalid entry: missing/invalid hash")
+        if not isinstance(encoding_raw, str) or not encoding_raw:
+            raise ValueError("Invalid entry: missing/invalid encoding")
+
+        rel_path = deobf_str(rel_path_raw)
+        size = deobf_int(size_raw)
+        expected_hash = deobf_str(expected_hash_raw)
+        encoding = deobf_str(encoding_raw)
+
         if os.path.isabs(rel_path) or ".." in Path(rel_path).parts:
             raise ValueError(f"Unsafe path in manifest: {rel_path}")
         if encoding != PAYLOAD_ENCODING:
