@@ -54,6 +54,7 @@ K_E = "e"
 K_C = "c"
 OBF_ASCII_SHIFT = 1
 OBF_INT_SHIFT = 7
+PB_B64_MAGIC = "TTB64V1"
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -92,6 +93,30 @@ def obf_int(value: int) -> int:
 
 def deobf_int(value: int) -> int:
     return value - OBF_INT_SHIFT
+
+
+def wrap_pb_base64(blob: bytes) -> str:
+    b64 = base64.b64encode(blob).decode("ascii")
+    lines = [PB_B64_MAGIC]
+    lines.extend(chunk_text(b64, width=88))
+    return "\n".join(lines) + "\n"
+
+
+def maybe_unwrap_pb_base64(raw: bytes) -> bytes:
+    try:
+        txt = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw
+    lines = txt.splitlines()
+    if not lines or lines[0].strip() != PB_B64_MAGIC:
+        return raw
+    payload = "".join(lines[1:]).strip()
+    if not payload:
+        raise ValueError("Invalid base64 protobuf wrapper: empty payload")
+    try:
+        return base64.b64decode(payload.encode("ascii"), validate=True)
+    except Exception as exc:
+        raise ValueError(f"Invalid base64 protobuf wrapper: {exc}") from exc
 
 
 def _pb_varint_encode(value: int) -> bytes:
@@ -254,7 +279,7 @@ def pack(repo: Path, out_file: Path) -> None:
         f.write("\n")
 
 
-def pack_pb(repo: Path, out_file: Path) -> None:
+def pack_pb(repo: Path, out_file: Path, as_base64_text: bool = False) -> None:
     repo = repo.resolve()
     if not repo.exists() or not repo.is_dir():
         raise ValueError(f"Repository path is not a directory: {repo}")
@@ -285,7 +310,11 @@ def pack_pb(repo: Path, out_file: Path) -> None:
         out += _pb_len_field(5, file_msg)
 
     out_file.parent.mkdir(parents=True, exist_ok=True)
-    out_file.write_bytes(bytes(out))
+    blob = bytes(out)
+    if as_base64_text:
+        out_file.write_text(wrap_pb_base64(blob), encoding="utf-8", newline="\n")
+    else:
+        out_file.write_bytes(blob)
 
 
 def unpack(in_file: Path, out_repo: Path) -> None:
@@ -372,7 +401,7 @@ def unpack_pb(in_file: Path, out_repo: Path) -> None:
     if not in_file.exists() or not in_file.is_file():
         raise ValueError(f"Input artifact not found: {in_file}")
 
-    data = in_file.read_bytes()
+    data = maybe_unwrap_pb_base64(in_file.read_bytes())
     pos = 0
     manifest_fields: dict[int, object] = {5: []}
     while pos < len(data):
@@ -472,6 +501,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_pack_pb.add_argument("repo", type=Path, help="Path to repository directory")
     p_pack_pb.add_argument("out", type=Path, help="Output protobuf file")
+    p_pack_pb.add_argument(
+        "--base64",
+        action="store_true",
+        help="Write protobuf as multiline base64 text with a small wrapper header",
+    )
 
     p_unpack_pb = sub.add_parser(
         "unpackpb", help="Unpack protobuf artifact into directory"
@@ -495,8 +529,9 @@ def main() -> None:
         unpack(args.in_file, args.out_repo)
         print(f"Unpacked '{args.in_file}' -> '{args.out_repo}'")
     elif args.command == "packpb":
-        pack_pb(args.repo, args.out)
-        print(f"Packed (protobuf) '{args.repo}' -> '{args.out}'")
+        pack_pb(args.repo, args.out, as_base64_text=args.base64)
+        mode = "protobuf+base64" if args.base64 else "protobuf"
+        print(f"Packed ({mode}) '{args.repo}' -> '{args.out}'")
     elif args.command == "unpackpb":
         unpack_pb(args.in_file, args.out_repo)
         print(f"Unpacked (protobuf) '{args.in_file}' -> '{args.out_repo}'")
